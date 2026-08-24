@@ -4,15 +4,12 @@ target/
 **/*.rs.bk
 
 # Environment files
-.env
-.env.local
 
 # Editor / IDE
 *.swp
 *.swo
 *~
 .idea/
-.vscode/
 
 # OS files
 .DS_Store
@@ -35,3 +32,9 @@ deployments.json
 # Test snapshots (auto-generated)
 test_snapshots/
 contracts/*/test_snapshots/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
+config.bat
+node_modules
