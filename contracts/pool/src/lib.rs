@@ -4,6 +4,8 @@ use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, BytesN, Env, IntoVal, Symbol, Vec,
 };
 
+
+
 mod constants;
 mod errors;
 mod events;
@@ -885,6 +887,288 @@ impl PoolContract {
             .set(&DataKey::MaxUtilizationBps, &new_cap_bps);
         Self::extend_instance_ttl(&env);
         true
+    }
+
+    /// Migrates an LP's full position from this pool to a target pool.
+    ///
+    /// Burns all of the LP's shares in this pool, transfers the redeemed USDC
+    /// to the target pool, and mints new shares there — all in a single
+    /// transaction. The LP's yield history (`LPYieldEarned`) is preserved in
+    /// the source pool for analytics; `LPInitialDeposit` and `LPDepositCount`
+    /// are cleaned up as on a full withdrawal.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `lp` - The liquidity provider address.
+    /// * `target_pool` - The target pool contract address.
+    ///
+    /// # Auth
+    /// Requires authorization from `lp`.
+    ///
+    /// # Safety Checks
+    /// * Source and target pools must differ (`MigrationToSelf`).
+    /// * LP must hold shares in this pool (`NoShares`).
+    /// * Target pool must be initialized (`MigrationTargetNotInitialized`).
+    /// * Target pool must use the same USDC asset (`MigrationAssetMismatch`).
+    /// * Target pool must have sufficient liquidity to accept the deposit.
+    ///
+    /// # Returns
+    /// * `MigrationRecord` - Details of the executed migration.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let record = client.migrate_position(&lp, &target_pool);
+    /// ```
+    pub fn migrate_position(env: Env, lp: Address, target_pool: Address) -> MigrationRecord {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic_with_error!(&env, PoolError::NotInitialized);
+        }
+        lp.require_auth();
+
+        let source_pool = env.current_contract_address();
+        if source_pool == target_pool {
+            panic_with_error!(&env, PoolError::MigrationToSelf);
+        }
+
+        // --- Safety check: LP must have shares ---
+        let lp_shares_key = DataKey::LPShares(lp.clone());
+        let lp_shares: u128 = env
+            .storage()
+            .persistent()
+            .get(&lp_shares_key)
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NoShares));
+        if lp_shares == 0 {
+            panic_with_error!(&env, PoolError::NoShares);
+        }
+
+        // --- Safety check: target pool must be initialized ---
+        let args = Vec::new(&env);
+        let _: PoolStats = env.invoke_contract(
+            &target_pool,
+            &Symbol::new(&env, "get_stats"),
+            args,
+        );
+        // get_stats panics with NotInitialized if uninitialized; reaching here means it's valid.
+
+        // --- Safety check: target pool must use the same USDC asset ---
+        let usdc_id = Self::usdc(&env);
+        let args = Vec::new(&env);
+        let target_usdc: Address = env.invoke_contract(
+            &target_pool,
+            &Symbol::new(&env, "get_usdc_asset"),
+            args,
+        );
+        if usdc_id != target_usdc {
+            panic_with_error!(&env, PoolError::MigrationAssetMismatch);
+        }
+
+        // --- Withdraw from source pool ---
+        let totals = Self::totals(&env);
+        let total_shares = totals.shares;
+        let total_deposits = totals.deposits;
+        let total_funded = totals.funded;
+        let available = total_deposits - total_funded;
+
+        let usdc_to_return = lp_shares * total_deposits / total_shares;
+        if usdc_to_return > available {
+            panic_with_error!(&env, PoolError::InsufficientLiquidity);
+        }
+
+        // Update source pool accounting (mirrors withdraw() logic)
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &(total_shares - lp_shares));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &(total_deposits - usdc_to_return));
+
+        // Yield accounting: compute principal portion and yield earned
+        let init_dep_key = DataKey::LPInitialDeposit(lp.clone());
+        let init_dep: u128 = env.storage().persistent().get(&init_dep_key).unwrap_or(0);
+        let principal_portion = lp_shares * init_dep / lp_shares; // = init_dep
+        let yield_earned = usdc_to_return.saturating_sub(principal_portion);
+
+        let yield_key = DataKey::LPYieldEarned(lp.clone());
+        let prev_yield: u128 = env.storage().persistent().get(&yield_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&yield_key, &(prev_yield + yield_earned));
+        env.storage()
+            .persistent()
+            .extend_ttl(&yield_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Remove LP position from source pool (full withdrawal)
+        env.storage().persistent().remove(&lp_shares_key);
+        env.storage().persistent().remove(&init_dep_key);
+        let dep_count_key = DataKey::LPDepositCount(lp.clone());
+        env.storage().persistent().remove(&dep_count_key);
+
+        // Transfer USDC from source to target pool
+        let usdc = token::Client::new(&env, &usdc_id);
+        usdc.transfer(
+            &source_pool,
+            &target_pool,
+            &(usdc_to_return as i128),
+        );
+
+        // --- Deposit into target pool via cross-contract call ---
+        let mut args = Vec::new(&env);
+        args.push_back(lp.clone().into_val(&env));
+        args.push_back(usdc_to_return.into_val(&env));
+        let shares_minted: u128 = env.invoke_contract(
+            &target_pool,
+            &Symbol::new(&env, "deposit"),
+            args,
+        );
+
+        // --- Record migration for analytics ---
+        let migration_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationCount)
+            .unwrap_or(0);
+        let record = MigrationRecord {
+            lp: lp.clone(),
+            source_pool: source_pool.clone(),
+            target_pool: target_pool.clone(),
+            shares_burned: lp_shares,
+            usdc_withdrawn: usdc_to_return,
+            shares_minted,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationRecord(migration_count), &record);
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationCount, &(migration_count + 1));
+
+        events::position_migrated(
+            &env,
+            &lp,
+            &target_pool,
+            lp_shares,
+            usdc_to_return,
+            shares_minted,
+        );
+        Self::extend_instance_ttl(&env);
+        record
+    }
+
+    /// Returns a pre-migration estimate without executing the migration.
+    ///
+    /// Computes how many USDC the LP would receive from this pool and how
+    /// many shares they would get in the target pool, plus the slippage
+    /// between the two share prices.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `lp` - The liquidity provider address.
+    /// * `target_pool` - The target pool contract address.
+    ///
+    /// # Auth
+    /// No authorization required (read-only).
+    ///
+    /// # Returns
+    /// * `MigrationEstimate` - The estimated migration outcome.
+    pub fn estimate_migration(env: Env, lp: Address, target_pool: Address) -> MigrationEstimate {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic_with_error!(&env, PoolError::NotInitialized);
+        }
+
+        let lp_shares: u128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LPShares(lp.clone()))
+            .unwrap_or(0);
+        if lp_shares == 0 {
+            panic_with_error!(&env, PoolError::NoShares);
+        }
+
+        let totals = Self::totals(&env);
+        let total_shares = totals.shares;
+        let total_deposits = totals.deposits;
+
+        let usdc_out = if total_shares > 0 {
+            lp_shares * total_deposits / total_shares
+        } else {
+            0
+        };
+
+        // Source share price scaled by 1e7 (stroops per share)
+        let source_price = if total_shares > 0 {
+            total_deposits * 10_000_000 / total_shares
+        } else {
+            10_000_000
+        };
+
+        // Query target pool stats
+        let args = Vec::new(&env);
+        let target_stats: PoolStats = env.invoke_contract(
+            &target_pool,
+            &Symbol::new(&env, "get_stats"),
+            args,
+        );
+
+        let target_price = if target_stats.total_shares > 0 {
+            target_stats.total_deposits * 10_000_000 / target_stats.total_shares
+        } else {
+            10_000_000
+        };
+
+        let shares_in = if target_stats.total_shares > 0 && target_stats.total_deposits > 0 {
+            usdc_out * target_stats.total_shares / target_stats.total_deposits
+        } else {
+            usdc_out
+        };
+
+        let slippage_bps = if source_price > 0 {
+            let diff = if source_price > target_price {
+                source_price - target_price
+            } else {
+                target_price - source_price
+            };
+            (diff * 10_000 / source_price) as u32
+        } else {
+            0
+        };
+
+        MigrationEstimate {
+            usdc_out,
+            shares_in,
+            source_share_price: source_price,
+            target_share_price: target_price,
+            slippage_bps,
+        }
+    }
+
+    /// Returns a migration record by index.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `index` - The migration record index (0-based).
+    ///
+    /// # Returns
+    /// * `MigrationRecord` - The migration record at the given index.
+    pub fn get_migration_record(env: Env, index: u64) -> MigrationRecord {
+        env.storage()
+            .instance()
+            .get(&DataKey::MigrationRecord(index))
+            .expect("migration record not found")
+    }
+
+    /// Returns the total number of migrations from this pool.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    /// * `u64` - The total migration count.
+    pub fn get_migration_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MigrationCount)
+            .unwrap_or(0)
     }
 
     fn utilization_bps_or_panic(env: &Env, total_funded: u128, total_deposits: u128) -> u32 {
