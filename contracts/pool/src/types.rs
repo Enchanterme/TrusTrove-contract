@@ -64,6 +64,42 @@ pub struct LPPosition {
     pub deposit_count: u32,
 }
 
+/// Snapshot of a single pool-to-pool migration, returned by `get_migration_record`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MigrationRecord {
+    /// LP address that initiated the migration.
+    pub lp: Address,
+    /// Source pool contract address.
+    pub source_pool: Address,
+    /// Target pool contract address.
+    pub target_pool: Address,
+    /// Shares burned in the source pool.
+    pub shares_burned: u128,
+    /// USDC withdrawn from the source pool (stroops).
+    pub usdc_withdrawn: u128,
+    /// Shares minted in the target pool.
+    pub shares_minted: u128,
+    /// Ledger timestamp of the migration.
+    pub timestamp: u64,
+}
+
+/// Pre-migration estimate returned by `estimate_migration`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MigrationEstimate {
+    /// USDC the LP would receive from the source pool (stroops).
+    pub usdc_out: u128,
+    /// Shares the LP would receive in the target pool.
+    pub shares_in: u128,
+    /// Share price in the source pool (total_deposits / total_shares, scaled by 1e7).
+    pub source_share_price: u128,
+    /// Share price in the target pool (scaled by 1e7).
+    pub target_share_price: u128,
+    /// Slippage in basis points: `|source_price - target_price| / source_price * 10_000`.
+    pub slippage_bps: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -82,4 +118,6 @@ pub enum DataKey {
     LPInitialDeposit(Address),
     FundedInvoice(BytesN<32>),
     MaxUtilizationBps,
+    MigrationCount,
+    MigrationRecord(u64),
 }

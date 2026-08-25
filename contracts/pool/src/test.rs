@@ -2053,3 +2053,339 @@ fn test_withdraw_before_initialize_panics() {
     }]);
     pool.withdraw(&lp, &1_000);
 }
+
+// ============== MIGRATION TESTS ==============
+
+/// Helper: sets up a second pool (target) wired to the same invoice/escrow/USDC
+/// contracts and returns its client + address.
+fn setup_target_pool(te: &TestEnv) -> (PoolContractClient<'static>, Address) {
+    let target_id = te.env.register_contract(None, PoolContract);
+    let target = PoolContractClient::new(&te.env, &target_id);
+    target.initialize(
+        &te.admin,
+        &te.invoice.address,
+        &te.env.register_contract(None, RealEscrow),
+        &te.usdc_id,
+    );
+    target.set_max_utilization(&te.admin, &10000);
+    (target, target_id)
+}
+
+#[test]
+fn test_migrate_position_basic() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    // LP deposits 10B into source pool
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    let pos_before = te.pool.get_lp_position(&te.lp);
+    assert_eq!(pos_before.shares, 10_000_000_000);
+
+    // Migrate to target pool
+    let record = te.pool.migrate_position(&te.lp, &target.address);
+
+    // Source pool: LP has no shares
+    let pos_after = te.pool.get_lp_position(&te.lp);
+    assert_eq!(pos_after.shares, 0);
+    assert_eq!(pos_after.usdc_value, 0);
+
+    // Source pool totals updated
+    let source_stats = te.pool.get_stats();
+    assert_eq!(source_stats.total_shares, 0);
+    assert_eq!(source_stats.total_deposits, 0);
+
+    // Target pool: LP has shares
+    let target_pos = target.get_lp_position(&te.lp);
+    assert_eq!(target_pos.shares, 10_000_000_000);
+    assert_eq!(target_pos.usdc_value, 10_000_000_000);
+
+    // Record fields
+    assert_eq!(record.lp, te.lp);
+    assert_eq!(record.shares_burned, 10_000_000_000);
+    assert_eq!(record.usdc_withdrawn, 10_000_000_000);
+    assert_eq!(record.shares_minted, 10_000_000_000);
+}
+
+#[test]
+fn test_migrate_position_with_yield() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    fund_and_repay_invoice(&te);
+
+    // Share price is now 1.02 (10.2B / 10B)
+    let pos = te.pool.get_lp_position(&te.lp);
+    assert_eq!(pos.usdc_value, DEFAULT_FACE_VALUE + DEFAULT_YIELD_AMOUNT);
+
+    let record = te.pool.migrate_position(&te.lp, &target.address);
+
+    // LP gets more USDC out than deposited (yield included)
+    assert!(record.usdc_withdrawn > 10_000_000_000);
+    assert_eq!(record.usdc_withdrawn, DEFAULT_FACE_VALUE + DEFAULT_YIELD_AMOUNT);
+
+    // Target pool mints shares at 1:1 (empty pool)
+    assert_eq!(record.shares_minted, record.usdc_withdrawn);
+
+    // Yield earned is preserved in source pool
+    let pos_after = te.pool.get_lp_position(&te.lp);
+    assert_eq!(pos_after.yield_earned, DEFAULT_YIELD_AMOUNT);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_migrate_to_self_panics() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.migrate_position(&te.lp, &te.pool_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_migrate_zero_shares_panics() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+    // LP has no shares
+    te.pool.migrate_position(&te.lp, &target.address);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_migrate_asset_mismatch_panics() {
+    let te = setup();
+    // Create target pool with a different USDC asset
+    let other_usdc = te.env.register_contract(None, MockToken);
+    let target_id = te.env.register_contract(None, PoolContract);
+    let target = PoolContractClient::new(&te.env, &target_id);
+    target.initialize(&te.admin, &te.invoice.address, &te.pool_id, &other_usdc);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.migrate_position(&te.lp, &target.address);
+}
+
+#[test]
+fn test_migrate_position_emits_event() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.migrate_position(&te.lp, &target.address);
+
+    let events = te.env.events().all();
+    let (contract, topics, data) = events.get(events.len() - 1).unwrap();
+    assert_eq!(contract, te.pool_id);
+    assert_eq!(
+        Symbol::try_from_val(&te.env, &topics.get(0).unwrap()).unwrap(),
+        Symbol::new(&te.env, "position_migrated")
+    );
+    assert_eq!(
+        Address::try_from_val(&te.env, &topics.get(1).unwrap()).unwrap(),
+        te.lp
+    );
+    assert_eq!(
+        Address::try_from_val(&te.env, &topics.get(2).unwrap()).unwrap(),
+        target.address
+    );
+    assert_eq!(
+        <(u128, u128, u128)>::try_from_val(&te.env, &data).unwrap(),
+        (10_000_000_000, 10_000_000_000, 10_000_000_000)
+    );
+}
+
+#[test]
+fn test_migrate_record_stored_and_retrievable() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.migrate_position(&te.lp, &target.address);
+
+    assert_eq!(te.pool.get_migration_count(), 1);
+    let record = te.pool.get_migration_record(&0);
+    assert_eq!(record.lp, te.lp);
+    assert_eq!(record.shares_burned, 10_000_000_000);
+    assert_eq!(record.usdc_withdrawn, 10_000_000_000);
+    assert_eq!(record.shares_minted, 10_000_000_000);
+}
+
+#[test]
+fn test_multiple_migrations_increment_count() {
+    let te = setup();
+    let (target1, _) = setup_target_pool(&te);
+    let (target2, _) = setup_target_pool(&te);
+
+    // LP1 migrates to target1
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.migrate_position(&te.lp, &target1.address);
+
+    // LP2 deposits and migrates to target2
+    let lp2 = create_lp_with_balance(&te, 100_000_000_000);
+    te.pool.deposit(&lp2, &20_000_000_000);
+    te.pool.migrate_position(&lp2, &target2.address);
+
+    assert_eq!(te.pool.get_migration_count(), 2);
+
+    let r0 = te.pool.get_migration_record(&0);
+    assert_eq!(r0.lp, te.lp);
+    let r1 = te.pool.get_migration_record(&1);
+    assert_eq!(r1.lp, lp2);
+}
+
+#[test]
+fn test_estimate_migration_basic() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+
+    let est = te.pool.estimate_migration(&te.lp, &target.address);
+    assert_eq!(est.usdc_out, 10_000_000_000);
+    assert_eq!(est.shares_in, 10_000_000_000);
+    assert_eq!(est.source_share_price, 10_000_000); // 1.0
+    assert_eq!(est.target_share_price, 10_000_000); // 1.0
+    assert_eq!(est.slippage_bps, 0);
+}
+
+#[test]
+fn test_estimate_migration_with_yield_slippage() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    fund_and_repay_invoice(&te);
+
+    // Source pool share price is 1.02, target is 1.0
+    let est = te.pool.estimate_migration(&te.lp, &target.address);
+    assert!(est.usdc_out > 10_000_000_000);
+    assert!(est.source_share_price > est.target_share_price);
+    assert!(est.slippage_bps > 0);
+}
+
+#[test]
+fn test_estimate_migration_does_not_modify_state() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+
+    let stats_before = te.pool.get_stats();
+    let pos_before = te.pool.get_lp_position(&te.lp);
+
+    let _est = te.pool.estimate_migration(&te.lp, &target.address);
+
+    let stats_after = te.pool.get_stats();
+    let pos_after = te.pool.get_lp_position(&te.lp);
+    assert_eq!(stats_before.total_shares, stats_after.total_shares);
+    assert_eq!(stats_before.total_deposits, stats_after.total_deposits);
+    assert_eq!(pos_before.shares, pos_after.shares);
+}
+
+#[test]
+fn test_migrate_after_partial_withdraw() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    te.pool.deposit(&te.lp, &20_000_000_000);
+    te.pool.withdraw(&te.lp, &5_000_000_000);
+
+    // LP has 15B shares remaining
+    let pos = te.pool.get_lp_position(&te.lp);
+    assert_eq!(pos.shares, 15_000_000_000);
+
+    let record = te.pool.migrate_position(&te.lp, &target.address);
+    assert_eq!(record.shares_burned, 15_000_000_000);
+    assert_eq!(record.usdc_withdrawn, 15_000_000_000);
+    assert_eq!(record.shares_minted, 15_000_000_000);
+
+    // Source pool is empty
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_shares, 0);
+    assert_eq!(stats.total_deposits, 0);
+}
+
+#[test]
+fn test_migrate_multi_lp_preserves_other_positions() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    let lp2 = create_lp_with_balance(&te, 100_000_000_000);
+
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.deposit(&lp2, &20_000_000_000);
+
+    // LP1 migrates, LP2 stays
+    te.pool.migrate_position(&te.lp, &target.address);
+
+    let lp2_pos = te.pool.get_lp_position(&lp2);
+    assert_eq!(lp2_pos.shares, 20_000_000_000);
+
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_shares, 20_000_000_000);
+    assert_eq!(stats.total_deposits, 20_000_000_000);
+}
+
+#[test]
+fn test_migrate_to_nonempty_target_pool() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    // LP2 deposits into target pool first
+    let lp2 = create_lp_with_balance(&te, 100_000_000_000);
+    target.deposit(&lp2, &50_000_000_000);
+
+    // LP1 deposits into source and migrates
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    let record = te.pool.migrate_position(&te.lp, &target.address);
+
+    // Target pool has both LPs
+    let target_stats = target.get_stats();
+    assert_eq!(target_stats.total_deposits, 60_000_000_000);
+    assert_eq!(target_stats.total_shares, 60_000_000_000);
+
+    let target_pos = target.get_lp_position(&te.lp);
+    assert_eq!(target_pos.shares, 10_000_000_000);
+    assert_eq!(record.shares_minted, 10_000_000_000);
+}
+
+#[test]
+fn test_get_migration_count_initially_zero() {
+    let te = setup();
+    assert_eq!(te.pool.get_migration_count(), 0);
+}
+
+#[test]
+#[should_panic(expected = "migration record not found")]
+fn test_get_migration_record_out_of_bounds_panics() {
+    let te = setup();
+    te.pool.get_migration_record(&0);
+}
+
+#[test]
+fn test_migrate_position_full_lifecycle_with_yield() {
+    let te = setup();
+    let (target, _target_id) = setup_target_pool(&te);
+
+    // Deposit, generate yield, then migrate
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    fund_and_repay_invoice(&te);
+
+    let pos_before = te.pool.get_lp_position(&te.lp);
+    assert!(pos_before.usdc_value > 10_000_000_000);
+
+    let record = te.pool.migrate_position(&te.lp, &target.address);
+
+    // Source pool yield is tracked
+    let source_pos = te.pool.get_lp_position(&te.lp);
+    assert_eq!(source_pos.yield_earned, DEFAULT_YIELD_AMOUNT);
+    assert_eq!(source_pos.shares, 0);
+
+    // Target pool reflects the full migrated value
+    let target_pos = target.get_lp_position(&te.lp);
+    assert_eq!(target_pos.shares, record.usdc_withdrawn);
+    assert_eq!(target_pos.usdc_value, record.usdc_withdrawn);
+
+    // LP can withdraw from target pool
+    let withdrawn = target.withdraw(&te.lp, &target_pos.shares);
+    assert_eq!(withdrawn, record.usdc_withdrawn);
+    assert!(withdrawn > 10_000_000_000);
+}
