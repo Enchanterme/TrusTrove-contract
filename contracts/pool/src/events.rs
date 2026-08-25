@@ -35,6 +35,24 @@ pub fn invoice_defaulted(env: &Env, invoice_id: &BytesN<32>, loss_amount: u128) 
     );
 }
 
+pub fn position_migrated(
+    env: &Env,
+    lp: &Address,
+    target_pool: &Address,
+    shares_burned: u128,
+    usdc_withdrawn: u128,
+    shares_minted: u128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "position_migrated"),
+            lp.clone(),
+            target_pool.clone(),
+        ),
+        (shares_burned, usdc_withdrawn, shares_minted),
+    );
+}
+
 #[allow(dead_code)]
 pub fn ownership_transferred(env: &Env, old_admin: &Address, new_admin: &Address) {
     env.events().publish(

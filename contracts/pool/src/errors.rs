@@ -18,4 +18,8 @@ pub enum PoolError {
     InvalidConfiguration = 15,
     AlreadyFunded = 16,
     ActiveCountUnderflow = 17,
+    MigrationToSelf = 18,
+    MigrationZeroShares = 19,
+    MigrationTargetNotInitialized = 20,
+    MigrationAssetMismatch = 21,
 }
